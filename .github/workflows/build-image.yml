@@ -1,0 +1,124 @@
+name: Build and publish custom Caddy image
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      caddy_version:
+        description: "Optional stable Caddy version to build, for example 2.10.2"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/caddy
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      caddy_version: ${{ steps.resolve.outputs.caddy_version }}
+      should_build: ${{ steps.inspect.outputs.should_build }}
+    steps:
+      - name: Resolve target Caddy version
+        id: resolve
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const requested = core.getInput("caddy_version", { required: false });
+            if (requested) {
+              const normalized = requested.replace(/^v/, "");
+              core.info(`Using manually requested version ${normalized}`);
+              core.setOutput("caddy_version", normalized);
+              return;
+            }
+
+            const release = await github.rest.repos.getLatestRelease({
+              owner: "caddyserver",
+              repo: "caddy",
+            });
+
+            if (release.data.draft || release.data.prerelease) {
+              core.setFailed("Latest Caddy release is not a stable release.");
+              return;
+            }
+
+            const version = release.data.tag_name.replace(/^v/, "");
+            core.info(`Latest stable Caddy version is ${version}`);
+            core.setOutput("caddy_version", version);
+        env:
+          INPUT_CADDY_VERSION: ${{ inputs.caddy_version }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether image tag already exists
+        id: inspect
+        env:
+          CADDY_VERSION: ${{ steps.resolve.outputs.caddy_version }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE_NAME}:${CADDY_VERSION}" >/dev/null 2>&1; then
+            echo "Image ${IMAGE_NAME}:${CADDY_VERSION} already exists."
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Image ${IMAGE_NAME}:${CADDY_VERSION} does not exist yet."
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+  build-and-push:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prepare image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ needs.check-release.outputs.caddy_version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=Custom Caddy with Cloudflare DNS
+            org.opencontainers.image.description=Custom Caddy image with github.com/caddy-dns/cloudflare built in
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.check-release.outputs.caddy_version }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            CADDY_VERSION=${{ needs.check-release.outputs.caddy_version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
