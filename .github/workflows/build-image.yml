@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       caddy_version: ${{ steps.resolve.outputs.caddy_version }}
-      should_build: ${{ steps.inspect.outputs.should_build }}
+      should_build: ${{ steps.finalize.outputs.should_build }}
     steps:
       - name: Resolve target Caddy version
         id: resolve
@@ -63,8 +63,32 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check whether image tag already exists
+      - name: Check whether upstream Docker tags are available
+        id: upstream
+        env:
+          CADDY_VERSION: ${{ steps.resolve.outputs.caddy_version }}
+        run: |
+          runtime_image="docker.io/library/caddy:${CADDY_VERSION}"
+          builder_image="docker.io/library/caddy:${CADDY_VERSION}-builder"
+
+          if ! docker buildx imagetools inspect "${runtime_image}" >/dev/null 2>&1; then
+            echo "Upstream runtime image ${runtime_image} is not available yet."
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if ! docker buildx imagetools inspect "${builder_image}" >/dev/null 2>&1; then
+            echo "Upstream builder image ${builder_image} is not available yet."
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Upstream runtime and builder images are available."
+          echo "should_build=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Check whether image tag already exists in GHCR
         id: inspect
+        if: steps.upstream.outputs.should_build == 'true'
         env:
           CADDY_VERSION: ${{ steps.resolve.outputs.caddy_version }}
         run: |
@@ -74,6 +98,24 @@ jobs:
           else
             echo "Image ${IMAGE_NAME}:${CADDY_VERSION} does not exist yet."
             echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Skip build because upstream image is not ready
+        if: steps.upstream.outputs.should_build != 'true'
+        run: echo "Skipping build because the upstream Caddy Docker images are not available yet."
+
+      - name: Finalize build decision
+        id: finalize
+        env:
+          UPSTREAM_READY: ${{ steps.upstream.outputs.should_build }}
+          GHCR_MISSING: ${{ steps.inspect.outputs.should_build }}
+        run: |
+          if [ "${UPSTREAM_READY}" != "true" ]; then
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+          elif [ "${GHCR_MISSING}" = "true" ]; then
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
           fi
 
   build-and-push:
