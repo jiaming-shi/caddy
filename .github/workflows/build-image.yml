@@ -2,7 +2,7 @@ name: Build and publish custom Caddy image
 
 on:
   schedule:
-    - cron: "17 */6 * * *"
+    - cron: "17 2 * * *"
   workflow_dispatch:
     inputs:
       caddy_version:
